@@ -63,8 +63,14 @@ func (s stream) Write(ctx context.Context, msg jsonrpc2.Message) (int64, error) 
 }
 
 func main() {
+	args := os.Args
+	if len(args) < 2 {
+		log.Fatalf("expected argument: %s <nvim-socket>", os.Args[0])
+	}
+	socket := args[1]
+
 	var err error
-	n, err = nvim.Dial("/tmp/nvim-socket")
+	n, err = nvim.Dial(socket)
 	if err != nil {
 		log.Fatal(err)
 	}
