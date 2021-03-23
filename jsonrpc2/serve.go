@@ -12,7 +12,7 @@ import (
 	"os"
 	"time"
 
-	"golang.org/x/tools/internal/event"
+	//"golang.org/x/tools/internal/event"
 	errors "golang.org/x/xerrors"
 )
 
@@ -106,10 +106,10 @@ func Serve(ctx context.Context, ln net.Listener, server StreamServer, idleTimeou
 			}()
 		case err := <-doneListening:
 			return err
-		case err := <-closedConns:
-			if !isClosingError(err) {
-				event.Error(ctx, "closed a connection", err)
-			}
+		case _ = <-closedConns:
+			//if !isClosingError(err) {
+			//	event.Error(ctx, "closed a connection", err)
+			//}
 			activeConns--
 			if activeConns == 0 {
 				connTimer.Reset(idleTimeout)

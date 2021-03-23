@@ -9,7 +9,7 @@ import (
 	"fmt"
 	"sync"
 
-	"golang.org/x/tools/internal/event"
+	//"golang.org/x/tools/internal/event"
 )
 
 // Handler is invoked to handle incoming requests.
@@ -96,12 +96,12 @@ func AsyncHandler(handler Handler) Handler {
 			close(unlockNext)
 			return innerReply(ctx, result, err)
 		}
-		_, queueDone := event.Start(ctx, "queued")
+		//_, queueDone := event.Start(ctx, "queued")
 		go func() {
 			<-waitForPrevious
-			queueDone()
+			//queueDone()
 			if err := handler(ctx, reply, req); err != nil {
-				event.Error(ctx, "jsonrpc2 async message delivery failed", err)
+				//event.Error(ctx, "jsonrpc2 async message delivery failed", err)
 			}
 		}()
 		return nil
