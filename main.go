@@ -113,7 +113,8 @@ func main() {
 		log.Fatal(err)
 	}
 
-	cmd := exec.Command("isabelle", "vscode_server", "-v", "-L", "/tmp/go-isa-lsp")
+	args = []string{"vscode_server", "-v", "-L", "/tmp/go-isa-lsp"}
+	cmd := exec.Command("isabelle", append(args, os.Args[2:]...)...)
 	lspin, err := cmd.StdinPipe()
 	if err != nil {
 		log.Fatal(err)
