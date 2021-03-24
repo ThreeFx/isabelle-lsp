@@ -4,10 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"os"
 	"os/exec"
+	"regexp"
+	"strings"
 	"sync"
 
 	"github.com/neovim/go-client/nvim"
@@ -17,6 +20,31 @@ import (
 var n *nvim.Nvim
 var sb nvim.Buffer
 var wd nvim.Window
+
+type Position struct {
+	Line      int `json:"line"`
+	Character int `json:"character"`
+}
+
+type Range struct {
+	Start Position `json:"start"`
+	End   Position `json:"end"`
+}
+
+type TextEdit struct {
+	Range   Range  `json:"range"`
+	NewText string `json:"newText"`
+}
+
+type WorkspaceEdit struct {
+	Changes map[string][]TextEdit `json:"changes"`
+}
+
+type CodeAction struct {
+	Title         string        `json:"title"`
+	Kind          string        `json:"kind"`
+	WorkspaceEdit WorkspaceEdit `json:"edit"`
+}
 
 type stub struct {
 	r io.Reader
@@ -110,30 +138,6 @@ func main() {
 	handleCommands(server, client)
 }
 
-func periodicUpdateCaret(s stream) {
-	b, err := n.CurrentBuffer()
-	if err != nil {
-		log.Fatal(err)
-	}
-	name, err := n.BufferName(b)
-	if err != nil {
-		log.Fatal(err)
-	}
-	pos, err := n.WindowCursor(0)
-	if err != nil {
-		log.Fatal(err)
-	}
-	var ft string
-	err = n.BufferOption(b, "filetype", &ft)
-	if err != nil {
-		log.Fatal(err)
-	}
-	if ft != "isabelle" {
-		return
-	}
-	sendUpdateCaret(s, pos[0]-3, pos[1], name)
-}
-
 func sendUpdateCaret(s stream, line, col int, uri string) {
 	type params struct {
 		Uri  string `json:"uri"`
@@ -171,7 +175,7 @@ func toIsabelleHandler(s stream) func(nvim.Buffer, ...interface{}) {
 	}
 }
 
-func proxyToIsabelleHandler(next proxy) proxy {
+func proxyToIsabelleHandler(next proxy, nv stream) proxy {
 	return func(to stream, msg jsonrpc2.Message) {
 		switch msg.(type) {
 		case *jsonrpc2.Notification:
@@ -181,15 +185,12 @@ func proxyToIsabelleHandler(next proxy) proxy {
 			switch c.Method() {
 			case "textDocument/hover":
 				next(to, msg)
-				log.Println("got hover")
+				log.Println("got hover, sending caretUpdate")
 				var params struct {
-					Position struct {
-						Line int `json:"line"`
-						Character int `json:"character"`
-					} `json:"position"`
+					Position     Position `json:"position"`
 					TextDocument struct {
 						Uri string `json:"uri"`
-					}
+					} `json:"textDocument"`
 				}
 				j, err := c.Params().MarshalJSON()
 				if err != nil {
@@ -200,6 +201,107 @@ func proxyToIsabelleHandler(next proxy) proxy {
 					log.Fatal(err)
 				}
 				sendUpdateCaret(to, params.Position.Line, params.Position.Character, params.TextDocument.Uri)
+			case "textDocument/codeAction":
+				log.Println("got codeAction, not forwarding")
+
+				var params struct {
+					Range        Range `json:"range"`
+					TextDocument struct {
+						Uri string `json:"uri"`
+					} `json:"textDocument"`
+				}
+				j, err := c.Params().MarshalJSON()
+				if err != nil {
+					log.Fatal(err)
+				}
+				err = json.Unmarshal(j, &params)
+				if err != nil {
+					log.Fatal(err)
+				}
+				if params.Range.Start.Line != params.Range.End.Line {
+					return
+				}
+
+				isaBuffer, err := n.BufferLines(sb, 0, -1, false)
+				if err != nil {
+					log.Fatal(err)
+				}
+
+				fix := ""
+				for _, line := range isaBuffer {
+					line := string(line)
+					if strings.HasPrefix(line, "Try this: ") {
+						fix = strings.TrimPrefix(line, "Try this: ")
+						break
+					}
+				}
+
+				if fix == "" {
+					return
+				}
+
+				r := regexp.MustCompile(` *\([0-9]+ ms\)`)
+				fix = r.ReplaceAllString(fix, "")
+
+				a := []CodeAction{{
+					WorkspaceEdit: WorkspaceEdit{
+						Changes: map[string][]TextEdit{
+							params.TextDocument.Uri: {
+								{
+									NewText: fix,
+									Range: Range{
+										Start: Position{
+											Line: params.Range.Start.Line,
+										},
+										End: Position{
+											Line: params.Range.Start.Line,
+										},
+									},
+								},
+							},
+						},
+					},
+				}}
+
+				linebarr, err := n.CurrentLine()
+				if err != nil {
+					log.Panic(err)
+				}
+				line := string(linebarr)
+
+				var origin string
+				if strings.Contains(line, "try0") {
+					origin = "try0"
+					ind := strings.LastIndex(line, "try0")
+					a[0].WorkspaceEdit.Changes[params.TextDocument.Uri][0].Range.Start.Character = ind
+					a[0].WorkspaceEdit.Changes[params.TextDocument.Uri][0].Range.End.Character = ind + 4
+				} else if strings.Contains(line, "try") {
+					origin = "try"
+					ind := strings.LastIndex(line, "try")
+					a[0].WorkspaceEdit.Changes[params.TextDocument.Uri][0].Range.Start.Character = ind
+					a[0].WorkspaceEdit.Changes[params.TextDocument.Uri][0].Range.End.Character = ind + 3
+				} else if strings.Contains(line, "sledgehammer") {
+					origin = "sledgehammer"
+					ind := strings.LastIndex(line, "sledgehammer")
+					a[0].WorkspaceEdit.Changes[params.TextDocument.Uri][0].Range.Start.Character = ind
+					a[0].WorkspaceEdit.Changes[params.TextDocument.Uri][0].Range.End.Character = ind + 12
+				} else {
+					return
+				}
+
+				a[0].Title = fmt.Sprintf("Replace '%s' with '%s'", origin, fix)
+
+				resp, err := jsonrpc2.NewResponse(c.ID(), a, nil)
+				if err != nil {
+					log.Fatal(err)
+				}
+
+				log.Printf("debug resp: %v", string(resp.Result()))
+
+				_, err = nv.Write(context.TODO(), resp)
+				if err != nil {
+					log.Fatal(err)
+				}
 			default:
 				next(to, msg)
 			}
@@ -356,7 +458,7 @@ func handleCommands(vim, isa stream) {
 	}
 	log.Print("nvim setup done")
 
-	go runProxy(vim, isa, proxyToIsabelleHandler(proxyLSP))
+	go runProxy(vim, isa, proxyToIsabelleHandler(proxyLSP, vim))
 	runProxy(isa, vim, proxyIsabelleHandler(proxyLSP))
 }
 
