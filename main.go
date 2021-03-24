@@ -17,6 +17,13 @@ import (
 	"go.lsp.dev/jsonrpc2"
 )
 
+const (
+	Error = 1 + iota
+	Warning
+	Information
+	Hint
+)
+
 var n *nvim.Nvim
 var sb nvim.Buffer
 var wd nvim.Window
@@ -26,9 +33,35 @@ type Position struct {
 	Character int `json:"character"`
 }
 
+type Diagnostic struct {
+	JsonRpc  string `json:"jsonrpc"` // must be "2.0"
+	Source   string `json:"source,omitempty"`
+	Severity int    `json:"severity,omitempty"`
+	Range    Range  `json:"range"`
+	Msg      string `json:"message"`
+}
+
+type Capabilities struct {
+	DefinitionProvider        bool        `json:"definitionProvider"`
+	HoverProvider             bool        `json:"hoverProvider"`
+	CompletionProvider        interface{} `json:"completionProvider"`
+	DocumentHighlightProvider bool        `json:"documentHighlightProvider"`
+	CodeActionProvider        bool        `json:"codeActionProvider"`
+	TextDocumentSync          int         `json:"textDocumentSync"`
+}
+
+type PublishDiagnostics struct {
+	Uri         string       `json:"uri"`
+	Diagnostics []Diagnostic `json:"diagnostics"`
+}
+
 type Range struct {
 	Start Position `json:"start"`
 	End   Position `json:"end"`
+}
+
+type PIDERange struct {
+	Range [4]int `json:"range"`
 }
 
 type TextEdit struct {
@@ -91,24 +124,20 @@ func (s stream) Write(ctx context.Context, msg jsonrpc2.Message) (int64, error) 
 }
 
 func main() {
-	args := os.Args
-	if len(args) < 2 {
-		log.Fatalf("expected argument: %s <nvim-socket>", os.Args[0])
-	}
-	socket := args[1]
-
-	var err error
-	n, err = nvim.Dial(socket)
-	if err != nil {
-		log.Fatal(err)
-	}
-
 	f, err := os.OpenFile("/tmp/loggggg", os.O_RDWR|os.O_CREATE|os.O_APPEND, 0640)
 	if err != nil {
 		log.Fatal(err)
 	}
 	log.SetOutput(f)
-	g, err := os.OpenFile("/tmp/logggggg", os.O_RDWR|os.O_CREATE|os.O_APPEND, 0640)
+
+	args := os.Args
+	if len(args) < 2 {
+		log.Fatalf("expected argument: %s <nvim-socket>", os.Args[0])
+	}
+	socket := args[1]
+	log.Printf("socket: %s", socket)
+
+	n, err = nvim.Dial(socket)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -132,7 +161,7 @@ func main() {
 		l: &sync.Mutex{},
 	}
 	client := stream{
-		s: jsonrpc2.NewStream(stub{r: lspout, w: io.MultiWriter(lspin, g)}),
+		s: jsonrpc2.NewStream(stub{r: lspout, w: lspin}),
 		l: &sync.Mutex{},
 	}
 
@@ -245,6 +274,7 @@ func proxyToIsabelleHandler(next proxy, nv stream) proxy {
 				fix = r.ReplaceAllString(fix, "")
 
 				a := []CodeAction{{
+					Kind: "quickfix",
 					WorkspaceEdit: WorkspaceEdit{
 						Changes: map[string][]TextEdit{
 							params.TextDocument.Uri: {
@@ -314,6 +344,9 @@ func proxyToIsabelleHandler(next proxy, nv stream) proxy {
 	}
 }
 
+var dMu = &sync.Mutex{}
+var diagnosticsToAdd = make(map[string]map[string][]Diagnostic)
+
 func proxyIsabelleHandler(next proxy) proxy {
 	return func(to stream, msg jsonrpc2.Message) {
 		switch msg.(type) {
@@ -338,16 +371,143 @@ func proxyIsabelleHandler(next proxy) proxy {
 				if err != nil {
 					log.Fatal(err)
 				}
+			case "PIDE/decoration":
+				log.Printf("got decoration")
+				// write into scratch buffer
+				var params struct {
+					Uri     string      `json:"uri"`
+					Type    string      `json:"type"`
+					Content []PIDERange `json:"content"`
+				}
+				j, err := c.Params().MarshalJSON()
+				if err != nil {
+					log.Fatal(err)
+				}
+				err = json.Unmarshal(j, &params)
+				if err != nil {
+					log.Fatal(err)
+				}
+
+				var msg string
+				switch params.Type {
+				case "dotted_information":
+					msg = "dotted_information"
+				default:
+					log.Printf("not handling %s", params.Type)
+					return
+				}
+
+				var ds []Diagnostic
+				for _, r := range params.Content {
+					start := Position{Line: r.Range[0], Character: r.Range[1]}
+					end := Position{Line: r.Range[2], Character: r.Range[3]}
+					ds = append(ds, Diagnostic{
+						JsonRpc:  "2.0",
+						Source:   "isa-lsp-proxy",
+						Severity: Hint,
+						Range:    Range{start, end},
+						Msg:      msg,
+					})
+				}
+
+				dMu.Lock()
+				m, ok := diagnosticsToAdd[params.Uri]
+				if !ok {
+					m = make(map[string][]Diagnostic)
+				}
+				if ds == nil {
+					delete(m, msg)
+				} else {
+					m[msg] = ds
+				}
+				diagnosticsToAdd[params.Uri] = m
+				dMu.Unlock()
+
+				sendDiagnostic(to, params.Uri)
+			case "textDocument/publishDiagnostics":
+				c := msg.(*jsonrpc2.Notification)
+				var params PublishDiagnostics
+				j, err := c.Params().MarshalJSON()
+				if err != nil {
+					log.Fatal(err)
+				}
+				err = json.Unmarshal(j, &params)
+				if err != nil {
+					log.Fatal(err)
+				}
+
+				dMu.Lock()
+				m, ok := diagnosticsToAdd[params.Uri]
+				if !ok {
+					m = make(map[string][]Diagnostic)
+				}
+				if params.Diagnostics == nil {
+					delete(m, "ORIGINAL_DIAGNOSTICS")
+				} else {
+					m["ORIGINAL_DIAGNOSTICS"] = params.Diagnostics
+				}
+				diagnosticsToAdd[params.Uri] = m
+				dMu.Unlock()
+
+				sendDiagnostic(to, params.Uri)
 			default:
 				next(to, msg)
 			}
 		case *jsonrpc2.Call:
 			next(to, msg)
 		case *jsonrpc2.Response:
-			next(to, msg)
+			r := msg.(*jsonrpc2.Response)
+			switch r.ID() {
+			case jsonrpc2.NewNumberID(0): // assume this is the response to initialize
+				log.Print("intercepted initial response")
+				var result struct {
+					Capabilities Capabilities `json:"capabilities"`
+				}
+				j, err := r.Result().MarshalJSON()
+				if err != nil {
+					log.Fatal(err)
+				}
+				err = json.Unmarshal(j, &result)
+				if err != nil {
+					log.Fatal(err)
+				}
+				result.Capabilities.CodeActionProvider = true
+				r, err := jsonrpc2.NewResponse(r.ID(), result, nil)
+				if err != nil {
+					log.Fatal(err)
+				}
+				_, err = to.Write(context.TODO(), r)
+				if err != nil {
+					log.Fatal(err)
+				}
+			default:
+				next(to, msg)
+			}
 		default:
 			log.Printf("unknown message type %T", msg)
 		}
+	}
+}
+
+func sendDiagnostic(s stream, uri string) {
+	var ds []Diagnostic
+
+	for _, d := range diagnosticsToAdd[uri] {
+		ds = append(ds, d...)
+	}
+
+	n, err := jsonrpc2.NewNotification("textDocument/publishDiagnostics", PublishDiagnostics{
+		Uri:         uri,
+		Diagnostics: ds,
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	b, err := json.Marshal(n)
+	log.Printf("notification: %s", string(b))
+	_, err = s.Write(context.TODO(), n)
+	if err != nil {
+		log.Fatal(err)
 	}
 }
 
